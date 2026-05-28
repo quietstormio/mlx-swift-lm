@@ -604,12 +604,12 @@ private final class Gemma4TextAttention: Module {
     let useKEqV: Bool
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale
+    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift?
+    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
     init(config: Gemma4TextConfiguration, layerIdx: Int) {
@@ -630,17 +630,28 @@ private final class Gemma4TextAttention: Module {
         self.isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
 
         self._qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: false)
-        self._kProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
-        if !useKEqV {
-            self._vProj.wrappedValue = Linear(
-                config.hiddenSize, numKVHeads * headDim, bias: false)
-        }
         self._oProj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: false)
         self._qNorm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: headDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: headDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
+        // KV-shared layers (indices [firstKVSharedLayer, hiddenLayers)) reuse
+        // a lower layer's K/V at inference time per Gemma 4's architecture
+        // (num_kv_shared_layers). Files produced by `mlx_lm.fuse` correctly
+        // OMIT k_proj/v_proj/k_norm/v_norm for these layers — banneker-fixes
+        // makes the model class skip constructing them so the load matches.
+        // Verbose base checkpoints (e.g. mlx-community/gemma-4-e4b-it-4bit
+        // which ships unused KV projections for layers 24-41) still load
+        // because Module construction tolerates extra weights when the
+        // optional slot is nil.
+        if !isKVSharedLayer {
+            self._kProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
+            if !useKEqV {
+                self._vProj.wrappedValue = Linear(
+                    config.hiddenSize, numKVHeads * headDim, bias: false)
+            }
+            self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
+                dimensions: headDim, eps: config.rmsNormEps)
+            self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
+        }
 
         let ropeKey = isSliding ? "sliding_attention" : "full_attention"
         let ropeConfig = config.ropeParameters[ropeKey]
@@ -674,16 +685,26 @@ private final class Gemma4TextAttention: Module {
             currentOffset = offset ?? 0
             kvState = sharedKV
         } else {
+            // banneker-fixes: KV-shared layers must receive sharedKV from
+            // the caller (Gemma4TextBackbone passes intermediates[sourceIdx].kv
+            // for layerIdx >= firstKVSharedLayerIdx). If we ever reach this
+            // branch on a KV-shared layer the model class was constructed
+            // without k_proj/v_proj/k_norm/v_norm and force-unwrapping would
+            // crash; precondition makes the failure mode obvious.
+            precondition(
+                !isKVSharedLayer,
+                "Gemma4Attention layer \(layerIdx) is KV-shared but sharedKV is nil — caller must pass intermediates[sourceIdx].kv"
+            )
             currentOffset = cache?.offset ?? 0
-            var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
+            var keys = kProj!(x).reshaped(batch, length, numKVHeads, headDim)
             var values =
                 if useKEqV {
                     keys
                 } else {
                     vProj!(x).reshaped(batch, length, numKVHeads, headDim)
                 }
-            keys = kNorm(keys).transposed(0, 2, 1, 3)
-            values = vNorm(values).transposed(0, 2, 1, 3)
+            keys = kNorm!(keys).transposed(0, 2, 1, 3)
+            values = vNorm!(values).transposed(0, 2, 1, 3)
             keys = rope(keys, offset: currentOffset)
             if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
@@ -1042,9 +1063,17 @@ private final class Gemma4TextBackbone: Module {
                 mask: layerMask,
                 cache: layerCache,
                 perLayerInput: layerInput,
-                sharedKV: hasExplicitCache && idx >= firstKVSharedLayerIdx
+                // banneker-fixes: always pass sharedKV for KV-shared layers
+                // (idx >= firstKVSharedLayerIdx), not only when an explicit
+                // cache exists. The architecture says these layers reuse a
+                // lower layer's K/V at every forward pass — including the
+                // first one. Files produced by `mlx_lm.fuse` correctly omit
+                // k_proj/v_proj for these layers, so the previous
+                // `hasExplicitCache &&` gate fell through to a kProj call
+                // that crashed with keyNotFound on Liberty / any fuse output.
+                sharedKV: idx >= firstKVSharedLayerIdx
                     ? intermediates[sourceIdx].kv : nil,
-                offset: hasExplicitCache && idx >= firstKVSharedLayerIdx
+                offset: idx >= firstKVSharedLayerIdx
                     ? intermediates[sourceIdx].offset : nil
             )
             h = output
