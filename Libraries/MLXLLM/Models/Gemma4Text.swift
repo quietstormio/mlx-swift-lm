@@ -746,6 +746,35 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
             sanitized[k] = v
         }
+
+        // banneker-fixes: ScaledLinear (used for per_layer_model_projection)
+        // holds `weight: MLXArray` directly, not nn.Linear, so MLX's
+        // nn.quantize() can't convert it at load time. Dequantize at sanitize
+        // time when the weight ships in 4-bit-packed form. See same fix in
+        // MLXVLM/Models/Gemma4.swift + upstream issue #1209. Probe both key
+        // prefixes — when Gemma4Model.sanitize remaps `language_model.X` →
+        // `language_model.model.X` the longer prefix wins; the bare-key form
+        // covers checkpoints loaded directly without the outer wrapper.
+        for plpBase in [
+            "language_model.model.per_layer_model_projection",
+            "model.per_layer_model_projection",
+        ] {
+            let wK = "\(plpBase).weight"
+            let sK = "\(plpBase).scales"
+            let bK = "\(plpBase).biases"
+            guard let packedW = sanitized[wK], let scales = sanitized[sK] else {
+                continue
+            }
+            let biases = sanitized[bK]
+            sanitized[wK] = dequantized(
+                packedW,
+                scales: scales, biases: biases,
+                groupSize: 64, bits: 4, mode: .affine)
+            sanitized.removeValue(forKey: sK)
+            sanitized.removeValue(forKey: bK)
+            break
+        }
+
         return sanitized
     }
 

@@ -1238,6 +1238,37 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             sanitized["language_model.lm_head.weight"] = embedWeight
         }
 
+        // banneker-fixes: per_layer_model_projection wraps a Gemma4ScaledLinear
+        // that holds `weight: MLXArray` directly (not nn.Linear), so MLX's
+        // nn.quantize() does not convert it to QuantizedLinear at load time.
+        // If the checkpoint stored the projection in 4-bit-packed form (e.g.
+        // any model produced by `mlx_lm.fuse` against a quantized base), the
+        // weight on disk has shape [rows, cols/8] with .scales/.biases
+        // siblings — and the constructed unquantized ScaledLinear errors with
+        // mismatchedSize. As a pragmatic shim (mirroring upstream issue #1209
+        // until ScaledLinear is made Quantizable), we dequantize the projection
+        // back to the expected unquantized shape at sanitize time. Memory cost:
+        // ~55MB for the typical [10752, 2560] projection. Removes .scales and
+        // .biases siblings so load_weights only sees the single weight key.
+        let plpKey = "language_model.model.per_layer_model_projection.weight"
+        let plpScalesKey = "language_model.model.per_layer_model_projection.scales"
+        let plpBiasesKey = "language_model.model.per_layer_model_projection.biases"
+        if let packedW = sanitized[plpKey],
+           let scales = sanitized[plpScalesKey] {
+            let biases = sanitized[plpBiasesKey]
+            // Infer bits/group_size from the scales shape since
+            // Gemma4TextConfiguration doesn't carry quantization metadata
+            // (that lives one level up on Gemma4Configuration). Standard
+            // MLX 4-bit affine quantization uses bits=4 and groupSize=64.
+            let dequant = dequantized(
+                packedW,
+                scales: scales, biases: biases,
+                groupSize: 64, bits: 4, mode: .affine)
+            sanitized[plpKey] = dequant
+            sanitized.removeValue(forKey: plpScalesKey)
+            sanitized.removeValue(forKey: plpBiasesKey)
+        }
+
         return sanitized
     }
 }
