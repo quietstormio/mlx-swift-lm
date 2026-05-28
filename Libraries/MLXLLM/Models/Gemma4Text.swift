@@ -691,6 +691,24 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // banneker-fixes: drop redundant k_proj/v_proj/k_norm/v_norm weights
+        // for KV-shared layers (top `num_kv_shared_layers` layers per Gemma 4
+        // architecture). Verbose base checkpoints (e.g.
+        // `mlx-community/gemma-4-e4b-it-4bit`, `unsloth/gemma-4-E4B-it-UD-MLX-4bit`)
+        // ship those weights as a side effect of mlx_lm.convert not stripping
+        // them; the model class now skips constructing the corresponding
+        // modules, so the loader would otherwise reject the file as
+        // `incompatibleItems`. Files produced by `mlx_lm.fuse` correctly
+        // omit these weights and load cleanly without filtering.
+        //
+        // Mirrors the Python `mlx_lm.gemma4.Model.sanitize` fix tracked
+        // upstream in #1205 / #1240 / #1158 / #1302.
+        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
+        let sharedLayerIdxStrings: Set<String> =
+            config.numKvSharedLayers > 0
+            ? Set((firstKvSharedLayerIdx ..< config.numHiddenLayers).map { String($0) })
+            : []
+
         var sanitized = [String: MLXArray]()
         for (k, v) in weights {
             // Skip vision/audio/rotary weights
@@ -701,6 +719,30 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 || k.contains("output_min")
             {
                 continue
+            }
+            // Drop KV-shared layer extras when the verbose base ships them.
+            // Match strings like
+            //   "language_model.model.layers.24.self_attn.k_proj.weight"
+            //   ".../layers/25/self_attn/v_norm.weight"
+            // We accept either `.` or `/` as separator since some converters
+            // use one and some the other.
+            if !sharedLayerIdxStrings.isEmpty {
+                let parts = k.split(omittingEmptySubsequences: false,
+                                    whereSeparator: { $0 == "." || $0 == "/" })
+                let strings = parts.map(String.init)
+                if let layersAt = strings.firstIndex(of: "layers"),
+                   layersAt + 2 < strings.count,
+                   sharedLayerIdxStrings.contains(strings[layersAt + 1]),
+                   strings[layersAt + 2] == "self_attn",
+                   layersAt + 3 < strings.count
+                {
+                    let mod = strings[layersAt + 3]
+                    if mod == "k_proj" || mod == "v_proj"
+                        || mod == "k_norm" || mod == "v_norm"
+                    {
+                        continue
+                    }
+                }
             }
             sanitized[k] = v
         }

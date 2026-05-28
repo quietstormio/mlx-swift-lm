@@ -1149,12 +1149,44 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // banneker-fixes: precompute KV-shared layer indices so the loop
+        // below can drop their k_proj/v_proj/k_norm/v_norm extras. See
+        // the same change + rationale in MLXLLM/Models/Gemma4Text.swift.
+        let firstKvSharedLayerIdx = config.hiddenLayers - config.numKVSharedLayers
+        let sharedLayerIdxStrings: Set<String> =
+            config.numKVSharedLayers > 0
+            ? Set((firstKvSharedLayerIdx ..< config.hiddenLayers).map { String($0) })
+            : []
+
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count + 1)
 
         for (key, value) in weights {
             if key.contains("rotary_emb") {
                 continue
+            }
+
+            // banneker-fixes: drop k_proj/v_proj/k_norm/v_norm entries for
+            // KV-shared layers when the verbose base ships them. Files
+            // produced by `mlx_lm.fuse` correctly omit them and the filter
+            // is a no-op.
+            if !sharedLayerIdxStrings.isEmpty {
+                let parts = key.split(omittingEmptySubsequences: false,
+                                      whereSeparator: { $0 == "." || $0 == "/" })
+                let strings = parts.map(String.init)
+                if let layersAt = strings.firstIndex(of: "layers"),
+                   layersAt + 2 < strings.count,
+                   sharedLayerIdxStrings.contains(strings[layersAt + 1]),
+                   strings[layersAt + 2] == "self_attn",
+                   layersAt + 3 < strings.count
+                {
+                    let mod = strings[layersAt + 3]
+                    if mod == "k_proj" || mod == "v_proj"
+                        || mod == "k_norm" || mod == "v_norm"
+                    {
+                        continue
+                    }
+                }
             }
 
             var newKey = key
