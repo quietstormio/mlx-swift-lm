@@ -213,16 +213,17 @@ private class Gemma4Attention: Module {
     let nHeads: Int
     let nKvHeads: Int
     let useKeqV: Bool
+    let isKvSharedLayer: Bool
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
-    @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale
+    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
+    @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale?
 
     @ModuleInfo var rope: RoPELayer
 
@@ -247,18 +248,33 @@ private class Gemma4Attention: Module {
             self.nKvHeads = config.numKeyValueHeads
         }
 
+        // banneker-fixes: KV-shared layers (top numKvSharedLayers per the
+        // Gemma 4 architecture) don't have their own k_proj/v_proj/k_norm/
+        // v_norm — they reuse a lower layer's K/V at inference time. Files
+        // produced by `mlx_lm.fuse` correctly omit those weights; the model
+        // class must skip constructing them so the load matches. The forward
+        // loop in Gemma4TextModelInner already passes intermediates[prevIdx]
+        // as sharedKV for every layer, including the shared ones, so the
+        // else-branch of callAsFunction never runs for a KV-shared layer
+        // (where kProj would be nil).
+        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
+        self.isKvSharedLayer =
+            config.numKvSharedLayers > 0 && layerIdx >= firstKvSharedLayerIdx
+
         self.scale = 1.0
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
-        self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
-        if !useKeqV {
-            self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
-        }
         self._oProj.wrappedValue = Linear(nHeads * effectiveHeadDim, dim, bias: false)
-
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
+
+        if !isKvSharedLayer {
+            self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            if !useKeqV {
+                self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            }
+            self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
+            self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
+        }
 
         // RoPE: sliding uses default, full uses proportional with partial rotation
         if isSliding {
@@ -299,8 +315,19 @@ private class Gemma4Attention: Module {
             keys = sharedK
             values = sharedV
         } else {
-            var k = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-            k = kNorm(k)
+            // banneker-fixes: this branch only runs for layers with their own
+            // k_proj/v_proj (i.e. !isKvSharedLayer). The caller in
+            // Gemma4TextModelInner already passes intermediates[prevIdx].kv
+            // for KV-shared layers, so we never reach here with kProj nil.
+            // The force-unwraps make the contract violation loud if it ever
+            // happens (instead of constructing dummy layers we'd silently
+            // misuse).
+            precondition(
+                !isKvSharedLayer,
+                "Gemma4Attention.callAsFunction: KV-shared layer \(layerIdx) reached the kProj branch — sharedKV must be passed by the caller"
+            )
+            var k = kProj!(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            k = kNorm!(k)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
 
@@ -310,7 +337,7 @@ private class Gemma4Attention: Module {
             } else {
                 v = k
             }
-            v = vNorm(v)
+            v = vNorm!(v)
             v = v.transposed(0, 2, 1, 3)
 
             if let cache {
