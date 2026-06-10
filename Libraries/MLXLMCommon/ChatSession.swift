@@ -24,6 +24,11 @@ public final class ChatSession {
         case empty
         case kvcache([KVCache])
         case history([Chat.Message])
+        /// banneker-kv-prefill: an unresolved prompt-prefix snapshot. Resolved
+        /// into `.kvcache` on the first generation, once the full prompt has
+        /// been tokenized and verified against the snapshot (see
+        /// ``PrefixState/resume(input:model:parameters:)``).
+        case prefix(PrefixState)
     }
 
     private let model: ModelContainer
@@ -243,6 +248,175 @@ public final class ChatSession {
         self.additionalContext = additionalContext
     }
 
+    /// Initialize the `ChatSession` from a prompt-prefix KV snapshot.
+    ///
+    /// banneker-kv-prefill: this enables in-memory prefix reuse for prompt
+    /// families that share a byte-exact prefix (retry / revise / repair
+    /// loops). Build the snapshot once with ``prefill(prompt:)``, then start
+    /// each generation from it:
+    ///
+    /// ```swift
+    /// let warm = ChatSession(container, instructions: system, generateParameters: params)
+    /// let state = try await warm.prefill(prompt: basePrompt)
+    ///
+    /// // any number of times, each with its own session:
+    /// let session = ChatSession(container, resuming: state, generateParameters: params)
+    /// let output = try await session.respond(to: basePrompt + repairSuffix)
+    /// ```
+    ///
+    /// The prompt passed to `respond`/`streamResponse` must be the **full**
+    /// prompt (the prefilled prompt plus any suffix). It is re-tokenized and
+    /// verified against the snapshot; only the un-cached remainder is
+    /// prefilled. On any mismatch the session silently falls back to a full
+    /// prefill — output is always correct, reuse is best-effort
+    /// (see ``PrefixState`` for the exact fallback conditions).
+    ///
+    /// The session's instructions are taken from the snapshot (they are part
+    /// of the cached prefix). After the first generation the session behaves
+    /// like a normal multi-turn session.
+    ///
+    /// - Parameters:
+    ///   - model: the ``ModelContainer`` — must be the same model the
+    ///     snapshot was prefilled with
+    ///   - prefix: the prompt-prefix snapshot from ``prefill(prompt:)``
+    ///   - generateParameters: parameters that control generation. The
+    ///     `maxKVSize` must match the prefill-time value or the session
+    ///     falls back to a full prefill.
+    ///   - processing: media processing configuration for images/videos
+    ///   - tools: optional tool specifications
+    ///   - toolDispatch: optional tool dispatch
+    ///   - additionalContext: optional model-specific context
+    public init(
+        _ model: ModelContainer,
+        resuming prefix: PrefixState,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.model = model
+        self.instructions = prefix.instructions
+        self.cache = .init(.prefix(prefix))
+        self.processing = processing
+        self.generateParameters = generateParameters
+        self.tools = tools
+        self.toolDispatch = toolDispatch
+        self.additionalContext = additionalContext
+    }
+
+    /// Run **only the prefill forward pass** for this session's instructions
+    /// plus `prompt`, and snapshot the resulting KV cache state.
+    ///
+    /// banneker-kv-prefill: unlike `respond(to:)` with `maxTokens: 1`, this
+    /// performs no decode turn at all — no token is sampled and nothing
+    /// beyond the prompt prefix enters the cache, so the snapshot is a clean
+    /// prefix that later generations can extend.
+    ///
+    /// The prompt is rendered through the model's chat template, and the
+    /// prefill deliberately stops **before** the template's end-of-user-turn
+    /// and generation tail (determined by probe renderings of extended
+    /// prompts). This is what makes the snapshot reusable for any
+    /// byte-suffix extension of `prompt`: the cached tokens are exactly the
+    /// rendering region that is invariant under appending to the user
+    /// message.
+    ///
+    /// This method does not modify the session's own conversation state; the
+    /// session can be a throwaway configured with the desired
+    /// `instructions` and `generateParameters`.
+    ///
+    /// - Parameter prompt: the user prompt prefix to prefill
+    /// - Returns: a reusable ``PrefixState`` snapshot
+    /// - Throws: ``ChatSessionError/prefixUnsupportedInput`` for inputs with
+    ///   masks/media or models that carry decoder state;
+    ///   ``ChatSessionError/emptyPrefix`` if no stable prefix could be
+    ///   determined (e.g. the rendering is empty or one token long)
+    public func prefill(prompt: String) async throws -> PrefixState {
+        let instructions = self.instructions
+        let processing = self.processing
+        let tools = self.tools
+        let additionalContext = self.additionalContext
+        let parameters = self.generateParameters
+
+        let box: SendableBox<PrefixState> = try await model.perform { context in
+            func render(_ userContent: String) async throws -> [Int] {
+                var messages: [Chat.Message] = []
+                if let instructions {
+                    messages.append(.system(instructions))
+                }
+                messages.append(.user(userContent))
+                let input = try await context.processor.prepare(
+                    input: UserInput(
+                        chat: messages, processing: processing,
+                        tools: tools, additionalContext: additionalContext))
+                guard input.text.mask == nil, input.image == nil, input.video == nil
+                else {
+                    throw ChatSessionError.prefixUnsupportedInput
+                }
+                return input.text.tokens.asArray(Int.self)
+            }
+
+            let fullTokens = try await render(prompt)
+
+            // Probe renderings: extending the user content perturbs the
+            // rendering after the user text but keeps everything before it.
+            // The common prefix across the probes is the region invariant
+            // under suffix extension — i.e. it excludes the chat template's
+            // end-of-user-turn + generation tail and any token that could
+            // merge across the boundary. Two dissimilar probes guard against
+            // a probe-specific BPE merge at the boundary.
+            let probeA = try await render(prompt + "\n\nA")
+            let probeB = try await render(prompt + " zq9!")
+
+            var consume = min(
+                commonPrefixLength(fullTokens, probeA),
+                commonPrefixLength(fullTokens, probeB))
+            // Always leave at least one token un-cached so a resume with the
+            // identical prompt still has a token to prime generation with.
+            consume = min(consume, fullTokens.count - 1)
+            guard consume > 0 else {
+                throw ChatSessionError.emptyPrefix
+            }
+
+            // Turn-free prefill of exactly `consume` tokens: chunked forward
+            // passes that only populate the KV cache. No sampling, no decode.
+            let cache = context.model.newCache(parameters: parameters)
+            let prefillInput = LMInput(text: .init(tokens: MLXArray(fullTokens[..<consume].map { Int32($0) })))
+            var decoderState: LMOutput.State? = nil
+            switch try context.model.prepare(
+                prefillInput, cache: cache, windowSize: parameters.prefillStepSize)
+            {
+            case .tokens(let remainder):
+                if remainder.tokens.size > 0 {
+                    let result = context.model(
+                        remainder[text: .newAxis], cache: cache, state: nil)
+                    decoderState = result.state
+                }
+            case .logits(let output):
+                // The model consumed the whole prefix while preparing; the
+                // computed logits are simply discarded (no sampling).
+                decoderState = output.state
+            }
+            // Models that carry decoder-side state (e.g. cross-attention)
+            // cannot be snapshotted by KV cache alone.
+            guard decoderState == nil else {
+                throw ChatSessionError.prefixUnsupportedInput
+            }
+            // Materialize the cache contents before the snapshot crosses
+            // task boundaries (MLXArray contract).
+            eval(cache)
+
+            return SendableBox(
+                PrefixState(
+                    instructions: instructions,
+                    prompt: prompt,
+                    tokens: Array(fullTokens[..<consume]),
+                    maxKVSize: parameters.maxKVSize,
+                    caches: cache))
+        }
+        return box.consume()
+    }
+
     /// Produces a response to a prompt.
     ///
     /// - Parameters:
@@ -386,6 +560,11 @@ public final class ChatSession {
                     }.consume()
 
                     var kvCache: [KVCache]
+                    // banneker-kv-prefill: a prefix snapshot can only be
+                    // resolved once the full prompt has been tokenized, so
+                    // resolution happens inside the loop below on the first
+                    // pass.
+                    var pendingPrefix: PrefixState? = nil
                     switch cache {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
@@ -399,6 +578,10 @@ public final class ChatSession {
                         kvCache = model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache)
                         messages.append(contentsOf: history)
+
+                    case .prefix(let prefixState):
+                        pendingPrefix = prefixState
+                        kvCache = []  // resolved below
                     }
 
                     // prepare the input
@@ -409,8 +592,22 @@ public final class ChatSession {
                         let userInput = UserInput(
                             chat: messages, processing: processing,
                             tools: tools, additionalContext: additionalContext)
-                        let input = try await processor.prepare(input: userInput)
+                        var input = try await processor.prepare(input: userInput)
                         messages.removeAll()
+
+                        // banneker-kv-prefill: verify the tokenized prompt
+                        // against the prefix snapshot and either reuse copied
+                        // KV state (processing only the remainder) or fall
+                        // back to a full prefill. Never wrong context.
+                        if let prefixState = pendingPrefix {
+                            pendingPrefix = nil
+                            let resumption = prefixState.resume(
+                                input: input, model: model,
+                                parameters: generateParameters)
+                            kvCache = resumption.cache
+                            input = resumption.input
+                            cache = .kvcache(kvCache)
+                        }
 
                         // generate output
                         let iterator = try TokenIterator(
@@ -545,7 +742,25 @@ public enum ChatSessionError: LocalizedError {
     /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
     case noCacheAvailable
 
+    /// ``ChatSession/prefill(prompt:)`` was called with input that cannot be
+    /// snapshotted (attention mask, images/videos, or a model that carries
+    /// decoder-side state outside the KV cache).
+    case prefixUnsupportedInput
+
+    /// ``ChatSession/prefill(prompt:)`` could not determine a non-empty
+    /// stable prompt prefix to cache.
+    case emptyPrefix
+
     public var errorDescription: String? {
-        "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        switch self {
+        case .noCacheAvailable:
+            return
+                "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        case .prefixUnsupportedInput:
+            return
+                "prefill(prompt:) supports text-only prompts on models whose generation state lives entirely in the KV cache."
+        case .emptyPrefix:
+            return "prefill(prompt:) could not determine a non-empty stable prompt prefix."
+        }
     }
 }
